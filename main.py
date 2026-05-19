@@ -37,7 +37,6 @@ class Logger:
     日志管理类
     负责程序运行日志的记录和输出
     """
-
     def __init__(self, log_file="log.txt"):
         """
         初始化日志系统
