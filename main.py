@@ -1329,7 +1329,7 @@ class JailMasterGUI:
             self.btn_click = ttk.Button(click_frame, text="点击", command=self.debug_click, width=8)
             self.btn_click.pack(side=tk.LEFT)
 
-            ttk.Label(debug_frame, text="格式: x,y 例如 100,100",
+            ttk.Label(debug_frame, text="注意添加MAP_新城市时候截图以1725, 810为比例",
                       foreground="gray", font=("微软雅黑", 8)).pack(anchor=tk.W, pady=(0, 5))
 
             # ===== 滑动功能 =====
@@ -2568,29 +2568,31 @@ class JailMasterGUI:
     def debug_test_buy(self):
         """
         测试买入功能
-        执行一次完整的买入流程，受主控按钮控制
+        执行一次完整的买入流程，与跑商逻辑相同
         """
         if not self.adb.connected:
             self.logger.error("ADB未连接，无法测试买入")
             messagebox.showwarning("警告", "请先连接ADB")
             return
 
-        # 如果主流程正在运行，提示用户
         if self.trade_route.is_running():
             self.logger.warning("跑商流程正在运行，请先停止")
             messagebox.showwarning("警告", "跑商流程正在运行，请先停止")
             return
 
         # 获取选择的城市
-        city = self.city_a_var.get()
-        if not city:
+        expected_city = self.city_a_var.get()
+        if not expected_city:
             self.logger.error("请选择城市A")
             messagebox.showwarning("警告", "请选择城市A")
             return
 
-        self.logger.info(f"========== 测试买入: {city} ==========")
+        self.logger.info(f"========== 测试买入: {expected_city} ==========")
 
-        # 设置测试模式
+        # 临时设置 trade_route 的城市A和城市B，用于 _click_access_city 中的遍历判断
+        self.trade_route.city_a = self.city_a_var.get()
+        self.trade_route.city_b = self.city_b_var.get()
+
         self.trade_route.test_mode = True
         self.trade_route.running = False
         self.trade_route.paused = False
@@ -2598,113 +2600,83 @@ class JailMasterGUI:
 
         def test_buy_thread():
             try:
-                # 检查是否被停止
                 if self.trade_route.stop_flag:
                     self.logger.info("测试买入被停止")
                     return
 
-                # 检查并进入主界面
-                if not self.trade_route._check_and_enter_main_ui():
-                    self.logger.error("无法进入主界面")
-                    return
-
+                # 1. 返回主界面
+                self.trade_route._back_to_main_ui()
                 time.sleep(1)
 
-                # 检查是否被停止
-                if self.trade_route.stop_flag:
-                    self.logger.info("测试买入被停止")
-                    return
-
-                # 点击访问城市
-                while self.trade_route.paused and self.trade_route.test_mode:
-                    time.sleep(0.5)
                 if self.trade_route.stop_flag:
                     return
 
-                if not self.trade_route._click_access_city():
-                    self.logger.error("点击访问城市失败")
-                    return
-                time.sleep(2)
+                # 2. 点击访问城市并识别当前城市
+                actual_city = self.trade_route._click_access_city(expected_city)
+                if not actual_city:
+                    actual_city = expected_city
+                self.logger.info(f"实际当前城市: {actual_city}")
 
-                # 检查是否被停止
-                if self.trade_route.stop_flag:
-                    self.logger.info("测试买入被停止")
-                    return
-
-                # 点击交易所
-                while self.trade_route.paused and self.trade_route.test_mode:
-                    time.sleep(0.5)
                 if self.trade_route.stop_flag:
                     return
 
-                if not self.trade_route._click_exchange(city):
-                    self.logger.error(f"找不到 {city} 的交易所")
+                # 3. 点击交易所
+                if not self.trade_route._click_exchange(actual_city):
+                    self.logger.error(f"找不到 {actual_city} 的交易所")
                     return
                 time.sleep(1)
 
-                # 检查是否被停止
                 if self.trade_route.stop_flag:
                     return
 
-                # 点击我要买
-                while self.trade_route.paused and self.trade_route.test_mode:
-                    time.sleep(0.5)
-                if self.trade_route.stop_flag:
-                    return
-
+                # 4. 点击我要买
                 if not self.trade_route._click_buy_button():
                     self.logger.error("点击我要买失败")
                     return
                 time.sleep(1)
 
-                # 执行买入操作
-                self.trade_route._execute_full_buy_operation(city)
+                # 5. 执行买入操作
+                self.trade_route._execute_full_buy_operation(actual_city)
 
                 self.logger.info("测试买入完成")
-                messagebox.showinfo("测试买入", f"买入测试完成!\n城市: {city}")
-
+                messagebox.showinfo("测试买入", f"买入测试完成!\n城市: {actual_city}")
 
             except Exception:
-
-
                 self.logger.error_red(f"测试买入异常:\n{traceback.format_exc()}")
-
                 messagebox.showerror("测试错误", "买入测试失败，请查看日志。")
-
             finally:
-
                 self.trade_route.test_mode = False
-
                 self.trade_route.stop_flag = False
+                # 恢复原来的城市设置
+                self.trade_route.city_a = self.city_a_var.get()
+                self.trade_route.city_b = self.city_b_var.get()
 
         threading.Thread(target=test_buy_thread, daemon=True).start()
 
     def debug_test_sell(self):
         """
         测试卖出功能
-        执行一次完整的卖出流程，受主控按钮控制
+        执行一次完整的卖出流程，与跑商逻辑相同
         """
         if not self.adb.connected:
             self.logger.error("ADB未连接，无法测试卖出")
             messagebox.showwarning("警告", "请先连接ADB")
             return
 
-        # 如果主流程正在运行，提示用户
         if self.trade_route.is_running():
             self.logger.warning("跑商流程正在运行，请先停止")
             messagebox.showwarning("警告", "跑商流程正在运行，请先停止")
             return
 
         # 获取选择的城市
-        city = self.city_b_var.get()
-        if not city:
+        expected_city = self.city_b_var.get()
+        if not expected_city:
             self.logger.error("请选择城市B")
             messagebox.showwarning("警告", "请选择城市B")
             return
 
-        self.logger.info(f"========== 测试卖出: {city} ==========")
+        self.logger.info(f"========== 测试卖出: {expected_city} ==========")
 
-        # 设置测试模式
         self.trade_route.test_mode = True
         self.trade_route.running = False
         self.trade_route.paused = False
@@ -2712,83 +2684,52 @@ class JailMasterGUI:
 
         def test_sell_thread():
             try:
-                # 检查是否被停止
                 if self.trade_route.stop_flag:
                     self.logger.info("测试卖出被停止")
                     return
 
-                # 检查并进入主界面
-                if not self.trade_route._check_and_enter_main_ui():
-                    self.logger.error("无法进入主界面")
-                    return
-
+                # 1. 返回主界面
+                self.trade_route._back_to_main_ui()
                 time.sleep(1)
 
-                # 检查是否被停止
-                if self.trade_route.stop_flag:
-                    self.logger.info("测试卖出被停止")
-                    return
-
-                # 点击访问城市
-                while self.trade_route.paused and self.trade_route.test_mode:
-                    time.sleep(0.5)
                 if self.trade_route.stop_flag:
                     return
 
-                if not self.trade_route._click_access_city():
-                    self.logger.error("点击访问城市失败")
-                    return
-                time.sleep(2)
+                # 2. 点击访问城市并识别当前城市
+                actual_city = self.trade_route._click_access_city(expected_city)
+                if not actual_city:
+                    actual_city = expected_city
+                self.logger.info(f"实际当前城市: {actual_city}")
 
-                # 检查是否被停止
-                if self.trade_route.stop_flag:
-                    self.logger.info("测试卖出被停止")
-                    return
-
-                # 点击交易所
-                while self.trade_route.paused and self.trade_route.test_mode:
-                    time.sleep(0.5)
                 if self.trade_route.stop_flag:
                     return
 
-                if not self.trade_route._click_exchange(city):
-                    self.logger.error(f"找不到 {city} 的交易所")
+                # 3. 点击交易所
+                if not self.trade_route._click_exchange(actual_city):
+                    self.logger.error(f"找不到 {actual_city} 的交易所")
                     return
                 time.sleep(1)
 
-                # 检查是否被停止
                 if self.trade_route.stop_flag:
                     return
 
-                # 点击我要卖
-                while self.trade_route.paused and self.trade_route.test_mode:
-                    time.sleep(0.5)
-                if self.trade_route.stop_flag:
-                    return
-
+                # 4. 点击我要卖
                 if not self.trade_route._click_sell_button():
                     self.logger.error("点击我要卖失败")
                     return
                 time.sleep(1)
 
-                # 执行卖出操作
-                self.trade_route._execute_full_sell_operation(city)
+                # 5. 执行卖出操作
+                self.trade_route._execute_full_sell_operation(actual_city)
 
                 self.logger.info("测试卖出完成")
-                messagebox.showinfo("测试卖出", f"卖出测试完成!\n城市: {city}")
-
+                messagebox.showinfo("测试卖出", f"卖出测试完成!\n城市: {actual_city}")
 
             except Exception:
-
-
-                self.logger.error_red(f"测试买入异常:\n{traceback.format_exc()}")
-
-                messagebox.showerror("测试错误", "买入测试失败，请查看日志。")
-
+                self.logger.error_red(f"测试卖出异常:\n{traceback.format_exc()}")
+                messagebox.showerror("测试错误", "卖出测试失败，请查看日志。")
             finally:
-
                 self.trade_route.test_mode = False
-
                 self.trade_route.stop_flag = False
 
         threading.Thread(target=test_sell_thread, daemon=True).start()
@@ -3799,6 +3740,7 @@ class TradeRoute:
             while self.paused and self.running:
                 time.sleep(0.5)
 
+            # 检查是否已达到20.0%
             screenshot = self.adb.screenshot()
             if screenshot:
                 text = self.image_rec.recognize_text(screenshot, self.BARGAIN_TARGET_AREA)
@@ -3806,6 +3748,7 @@ class TradeRoute:
                     self.logger.info("已达到20.0%砍价目标")
                     break
 
+            # 点击砍价按钮
             x1, y1, x2, y2 = self.BUY_ALL_AREA
             self.adb.click((x1 + x2) // 2, (y1 + y2) // 2)
             self.logger.info(f"点击砍价按钮, 第{attempt + 1}次")
@@ -3814,54 +3757,20 @@ class TradeRoute:
             # 插入满疲劳检测
             self._check_and_handle_full_fatigue()
 
+            # 插入无法议价检测（霉比）
+            if self._check_and_handle_unable_to_bargain():
+                self.logger.info("检测到无法议价，停止砍价流程")
+                break
+
         self.logger.info("砍价流程结束")
 
     def _click_buy_until_empty(self):
-        """点击买入直到没有买入 - 修复版"""
+        """点击买入按钮1次"""
         self.logger.info("开始买入流程...")
-        buy_count = 0
-        consecutive_no_buy = 0
-
-        for _ in range(50):
-            if self._check_stop():
-                break
-            while self.paused and self.running:
-                time.sleep(0.5)
-
-            # 先检查是否还有买入按钮
-            screenshot = self.adb.screenshot()
-            has_buy_button = True  # 默认认为有
-
-            if screenshot:
-                text = self.image_rec.recognize_text(screenshot, self.BUY_BUTTON_AREA)
-                self.logger.info(f"识别到文字: '{text}'")
-
-                if text and "买入" in text:
-                    # 有"买入"文字，重置计数器
-                    consecutive_no_buy = 0
-                    has_buy_button = True
-                else:
-                    # 没有"买入"文字，增加计数器
-                    consecutive_no_buy += 1
-                    has_buy_button = False
-                    self.logger.info(f"未检测到买入按钮，连续{consecutive_no_buy}次")
-
-                    if consecutive_no_buy >= 2:
-                        self.logger.info("连续2次未检测到买入按钮，停止买入")
-                        break
-
-            # 只有检测到买入按钮时才点击
-            if has_buy_button:
-                x1, y1, x2, y2 = self.BUY_BUTTON_AREA
-                self.adb.click((x1 + x2) // 2, (y1 + y2) // 2)
-                buy_count += 1
-                self.logger.info(f"点击买入按钮, 第{buy_count}次")
-                time.sleep(0.3)
-            else:
-                # 没有检测到买入按钮，等待一下再检查
-                time.sleep(0.5)
-
-        self.logger.info(f"买入流程结束, 共点击{buy_count}次")
+        x1, y1, x2, y2 = self.BUY_BUTTON_AREA
+        self.adb.click((x1 + x2) // 2, (y1 + y2) // 2)
+        self.logger.info(f"点击买入按钮, 共1次")
+        self.logger.info("买入流程结束")
 
     def _execute_full_buy_operation(self, city_name):
         """
@@ -3934,26 +3843,50 @@ class TradeRoute:
             self.adb.click((x1 + x2) // 2, (y1 + y2) // 2)
             self.logger.info(f"点击抬价按钮, 第{attempt + 1}次")
             time.sleep(0.5)
+
             # 插入满疲劳检测
             self._check_and_handle_full_fatigue()
+
+            # 插入无法议价检测（霉比）
+            if self._check_and_handle_unable_to_bargain():
+                self.logger.info("检测到无法议价，停止抬价流程")
+                break
+
         self.logger.info("抬价流程结束")
 
-    def _click_sell_until_empty(self):
+    def _check_and_handle_unable_to_bargain(self):
         """
-        点击卖出按钮固定次数（例如3次）
+        检测无法议价图片（霉比.png），如果找到则点击交易所取消并返回True
+        只进行一次检测，不循环查找
+        :return: True=检测到无法议价，False=未检测到
         """
-        self.logger.info("开始卖出流程...")
-        sell_count = 0
-        max_clicks = 3  # 可根据需要调整
-        for _ in range(max_clicks):
-            if self._check_stop():
-                break
-            x1, y1, x2, y2 = self.BUY_BUTTON_AREA
-            self.adb.click((x1 + x2) // 2, (y1 + y2) // 2)
-            sell_count += 1
-            self.logger.info(f"点击卖出按钮, 第{sell_count}次")
+        screenshot = self.adb.screenshot()
+        if not screenshot:
+            return False
+
+        result = self.image_rec.find_image(screenshot, "霉比.png", )
+        if result:
+            self.logger.info("检测到无法议价（霉比），点击交易所取消")
+            # 寻图点击交易所取消
+            if self.image_rec.find_and_click(self.adb, "交易所取消.png", ):
+                self.logger.info("点击交易所取消成功")
+            else:
+                # 备用坐标点击
+                self.logger.warning("未找到交易所取消按钮，使用备用坐标")
+                self.adb.click(800, 600)
             time.sleep(0.5)
-        self.logger.info(f"卖出流程结束, 共点击{sell_count}次")
+            return True
+
+        return False
+
+
+    def _click_sell_until_empty(self):
+        """点击卖出按钮1次"""
+        self.logger.info("开始卖出流程...")
+        x1, y1, x2, y2 = self.BUY_BUTTON_AREA
+        self.adb.click((x1 + x2) // 2, (y1 + y2) // 2)
+        self.logger.info(f"点击卖出按钮, 共1次")
+        self.logger.info("卖出流程结束")
 
     def _execute_full_sell_operation(self, city_name):
         self.logger.info(f"在 {city_name} 执行完整卖出操作")
@@ -4079,18 +4012,39 @@ class TradeRoute:
         self.logger.warning("未检测到退出文字，继续执行")
 
     def _exit_trade_interface(self):
+        """退出交易界面（卖出后调用）- 检测空白区域文字后点击退出"""
         self.logger.info("退出交易界面...")
-        # 点击空白区域退出
+
         BLANK_AREA = (832, 982, 1085, 1059)
-        blank_center = ((BLANK_AREA[0] + BLANK_AREA[2]) // 2, (BLANK_AREA[1] + BLANK_AREA[3]) // 2)
-        self.adb.click(blank_center[0], blank_center[1])
-        time.sleep(1)
+        blank_center = ((BLANK_AREA[0] + BLANK_AREA[2]) // 2,
+                        (BLANK_AREA[1] + BLANK_AREA[3]) // 2)
 
-        # 检测并点击“我要买”按钮
-        if self.image_rec.find_and_click(self.adb, "我要买.png",  ):
-            self.logger.info("通过图像识别点击我要买成功")
-            return True
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            if self._check_stop():
+                return False
+            while self.paused and self.running:
+                time.sleep(0.5)
 
+            screenshot = self.adb.screenshot()
+            if not screenshot:
+                time.sleep(0.5)
+                continue
+
+            # 检查空白区域是否有'触碰空白区域退出'文字
+            text = self.image_rec.recognize_text(screenshot, BLANK_AREA)
+            self.logger.info(f"空白区域识别到文字: '{text}'")
+
+            if text and "触碰空白区域退出" in text:
+                self.logger.info(f"检测到'触碰空白区域退出'文字，点击坐标: ({blank_center[0]}, {blank_center[1]})")
+                self.adb.click(blank_center[0], blank_center[1])
+                time.sleep(0.5)
+                break
+
+            self.logger.info(f"未检测到退出文字，第{attempt + 1}次重试")
+            time.sleep(0.5)
+
+        # 仅保留文字识别“我要买”，删除图像识别
         screenshot = self.adb.screenshot()
         if screenshot:
             buy_text = self.image_rec.recognize_text(screenshot, self.BUY_CONFIRM_AREA)
@@ -4101,6 +4055,7 @@ class TradeRoute:
                 self.adb.click(buy_center[0], buy_center[1])
                 time.sleep(1)
                 return True
+
         self.logger.warning("未检测到我要买按钮")
         return False
     # ==================== 公共操作 ====================
@@ -4448,20 +4403,38 @@ class TradeRoute:
             return False
 
         # 点击拖车
-        if not self.image_rec.find_and_click(self.adb, "拖车.png",  ):
+        if not self.image_rec.find_and_click(self.adb, "拖车.png"):
             self.logger.warning("未找到拖车按钮")
             return False
         time.sleep(1.6)
+
         # 点击拖车确认（此操作即启动旅途）
-        if not self.image_rec.find_and_click(self.adb, "拖车确认.png",  ):
+        if not self.image_rec.find_and_click(self.adb, "拖车确认.png"):
             self.logger.warning("未找到拖车确认按钮")
             return False
         self.logger.info("拖车确认已点击，旅途启动")
+
+        # 延迟0.5秒后检测拖车过次
+        time.sleep(0.5)
+
+        # 检测拖车过次
+        screenshot = self.adb.screenshot()
+        if screenshot:
+            result = self.image_rec.find_image(screenshot, "拖车过次.png")
+            if result:
+                self.logger.info("检测到拖车过次，点击拖车过次确认")
+                if self.image_rec.find_and_click(self.adb, "拖车过次确认.png"):
+                    self.logger.info("点击拖车过次确认成功")
+                else:
+                    self.logger.warning("未找到拖车过次确认按钮")
+                time.sleep(0.5)
+
         # 数量减1
         new_count = count - 1
         self.config.set('Trailer', 'count', str(new_count))
         if hasattr(self, 'trailer_count_var'):
             self.trailer_count_var.set(str(new_count))
+
         return True
 
     def _handle_outdoor_phase(self):
@@ -4490,7 +4463,7 @@ class TradeRoute:
                 if self._check_stop():
                     return False
                 screenshot = self.adb.screenshot()
-                if screenshot and self.image_rec.find_image(screenshot, "行车检测.png", threshold=0.7):
+                if screenshot and self.image_rec.find_image(screenshot, "行车检测.png", ):
                     self.logger.info("检测到行车检测，进入户外")
                     break
                 time.sleep(1)
@@ -4503,7 +4476,7 @@ class TradeRoute:
                 screenshot = self.adb.screenshot()
                 if screenshot:
                     # 图像识别“进入站点”
-                    result = self.image_rec.find_image(screenshot, "进入站点.png", threshold=0.7)
+                    result = self.image_rec.find_image(screenshot, "进入站点.png", )
                     if result:
                         self.logger.info(f"检测到进入站点，点击坐标: ({result[0]}, {result[1]})")
                         self.adb.click(result[0], result[1])
