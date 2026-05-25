@@ -826,7 +826,7 @@ class ImageRecognition:
                         break
 
                 if not template_path:
-                    self.logger.error_red(f"模板图片不存在: {template_name}")
+                    self.logger.error_red(f"[Warning]模板图片不存在: {template_name}")
                     return None
 
             # 读取截图 - 支持中文路径
@@ -1086,7 +1086,7 @@ class JailMasterGUI:
         self.auto_connect_on_startup()
         def global_exception_handler(exc_type, exc_value, exc_tb):
             error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
-            self.logger.error_red(f"未捕获的异常:\n{error_msg}")
+            self.logger.error_red(f"[Warning]未捕获的异常:\n{error_msg}")
             messagebox.showerror("程序错误", "发生严重错误，请查看日志。")
 
         sys.excepthook = global_exception_handler
@@ -2642,7 +2642,7 @@ class JailMasterGUI:
                 messagebox.showinfo("测试买入", f"买入测试完成!\n城市: {actual_city}")
 
             except Exception:
-                self.logger.error_red(f"测试买入异常:\n{traceback.format_exc()}")
+                self.logger.error_red(f"[Warning]测试买入异常:\n{traceback.format_exc()}")
                 messagebox.showerror("测试错误", "买入测试失败，请查看日志。")
             finally:
                 self.trade_route.test_mode = False
@@ -2726,7 +2726,7 @@ class JailMasterGUI:
                 messagebox.showinfo("测试卖出", f"卖出测试完成!\n城市: {actual_city}")
 
             except Exception:
-                self.logger.error_red(f"测试卖出异常:\n{traceback.format_exc()}")
+                self.logger.error_red(f"[Warning]测试卖出异常:\n{traceback.format_exc()}")
                 messagebox.showerror("测试错误", "卖出测试失败，请查看日志。")
             finally:
                 self.trade_route.test_mode = False
@@ -2837,7 +2837,7 @@ class JailMasterGUI:
 
             except Exception:
 
-                self.logger.error_red(f"测试买入异常:\n{traceback.format_exc()}")
+                self.logger.error_red(f"[Warning]测试买入异常:\n{traceback.format_exc()}")
 
                 messagebox.showerror("测试错误", "买入测试失败，请查看日志。")
 
@@ -3122,7 +3122,7 @@ class TradeRoute:
 
             self._finish()
         except Exception:
-            self.logger.error_red(f"跑商异常:\n{traceback.format_exc()}")
+            self.logger.error_red(f"[Warning]跑商异常:\n{traceback.format_exc()}")
             self._finish()
     # ==================== 基础操作 ====================
     def _check_and_enter_main_ui(self):
@@ -4470,7 +4470,7 @@ class TradeRoute:
 
             # 等待到站检测
             self.logger.info("等待到站检测...")
-            for _ in range(120):
+            for _ in range(390):
                 if self._check_stop():
                     return False
                 screenshot = self.adb.screenshot()
@@ -4480,20 +4480,12 @@ class TradeRoute:
                     if result:
                         self.logger.info(f"检测到进入站点，点击坐标: ({result[0]}, {result[1]})")
                         self.adb.click(result[0], result[1])
-                        time.sleep(1)
+                        time.sleep(3)
                         self.logger.info("户外环节完成，进入卖出环节")
                         return True
-                    # 文字识别“进入站点”
-                    text = self.image_rec.recognize_text(screenshot, (500, 300, 1000, 500))
-                    if text and "进入站点" in text:
-                        self.logger.info("识别到'进入站点'文字")
-                        self.adb.click(800, 600)
-                        time.sleep(1)
-                        self.logger.info("户外环节完成，进入卖出环节")
-                        return True
-                time.sleep(1)
+                time.sleep(5)
 
-            self.logger.warning("未检测到进入站点，超时")
+            self.logger.error_red("[Warning]未检测到进入站点，超时")
             return False
         finally:
             self.litter_running = False
