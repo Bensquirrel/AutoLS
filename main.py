@@ -2,6 +2,14 @@ import configparser
 import ctypes
 import logging
 import os
+# PyTorch 内存分配优化
+import torch
+#完整的内存优化配置
+os.environ['OMP_NUM_THREADS'] = '2'
+os.environ['MKL_NUM_THREADS'] = '2'
+os.environ['TORCH_NO_CUDA'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+torch.set_num_threads(2)  # 等同上面环境变量
 import platform
 import subprocess  # 添加 subprocess 导入
 import sys
@@ -665,15 +673,18 @@ class ImageRecognition:
             # 配置 EasyOCR 使用本地模型路径
             # 通过设置环境变量或直接传递给 Reader
 
-            # EasyOCR 的模型路径可以通过 model_storage_directory 参数指定
+            # 优化参数：只加载必要模型，禁用GPU
             self.easyocr_reader = easyocr.Reader(
-                ['ch_sim'],  # 语言列表：中文简体 + 英文
-                gpu=False,  # 使用 CPU 模式
-                model_storage_directory=str(model_storage_path),  # 指定模型存储目录
-                download_enabled=True,  # 允许下载缺失的模型
-                verbose=False  # 关闭详细日志输出
+                ['ch_sim'],
+                gpu=False,
+                model_storage_directory=str(model_storage_path),
+                verbose=False,
+                # 以下参数降低内存
+                quantize=True,  # 模型量化，减少内存
+                download_enabled=False,  # 禁止下载（已有模型时）
             )
-            self.logger.info("EasyOCR 已就绪，支持中英文识别")
+
+            self.logger.info("EasyOCR 已就绪，支持中文识别")
             self.logger.info(f"模型将保存在: {model_storage_path}")
 
         except Exception as e:
@@ -805,7 +816,7 @@ class ImageRecognition:
         """
         if threshold is None:
             threshold = self.match_threshold  # 使用初始化时从配置读取的值
-            self.logger.debug(f"使用默认匹配阈值: {threshold}")
+            #self.logger.debug(f"使用默认匹配阈值: {threshold}")
 
         try:
 
@@ -2957,9 +2968,17 @@ class TradeRoute:
         self.city_a = ""
         self.city_b = ""
         self.litter_running = False  # 捡垃圾线程控制标志
+
+        # 新增 Event 用于高效等待
+        self._stop_event = threading.Event()  # 停止事件（set=停止）
+        self._pause_event = threading.Event()  # 暂停事件（set=暂停，clear=运行）
+
+        # 初始状态：运行中，未停止，未暂停
+        self._stop_event.clear()
+        self._pause_event.clear()
+
         # 跑商线程
         self.trade_thread = None
-
         # 坐标定义
         self.ACCESS_CITY_AREA = (1584, 683, 1907, 780)  # 访问城市按钮区域
         self.CITY_RECOGNITION_AREA = (7, 772, 814, 969)  # 城市名称识别区域
@@ -2982,27 +3001,35 @@ class TradeRoute:
 
     def start(self):
         """开始跑商流程"""
+        # 检查是否已在运行
         if self.running:
             self.logger.warning("跑商已在运行中")
             return False
 
+        # 重置所有状态
         self.running = True
         self.paused = False
         self.stop_flag = False
+        self.test_mode = False
+
+        # 重置 Event
+        self._stop_event.clear()
+        self._pause_event.clear()
+
         self.logger.info("开始跑商流程")
 
         self.trade_thread = threading.Thread(target=self._run_trade_loop, daemon=True)
         self.trade_thread.start()
         return True
-
     def stop(self):
         """停止跑商（包括测试模式）"""
         self.logger.info("停止跑商流程")
         self.stop_flag = True
         self.running = False
         self.paused = False
-        # 同时停止测试模式
         self.test_mode = False
+        self._stop_event.set()  # 设置停止事件
+        self._pause_event.set()  # 唤醒可能正在等待的线程
 
     def pause(self):
         """暂停跑商（包括测试模式）"""
@@ -3012,6 +3039,7 @@ class TradeRoute:
             return
         self.logger.info("暂停跑商流程")
         self.paused = True
+        self._pause_event.set()  # 设置暂停信号
 
     def resume(self):
         """恢复跑商（包括测试模式）"""
@@ -3021,6 +3049,24 @@ class TradeRoute:
             return
         self.logger.info("恢复跑商流程")
         self.paused = False
+        self._pause_event.clear()  # 清除暂停信号，唤醒等待的线程
+
+    def _check_stop(self):
+        """检查是否停止"""
+        return self.stop_flag or self._stop_event.is_set()
+
+    def _wait_if_paused(self):
+        """
+        如果处于暂停状态则等待，返回 True 表示应该停止
+        使用 Event.wait() 阻塞，不消耗 CPU
+        """
+        if self.paused:
+            self.logger.debug("进入暂停等待...")
+            # 等待直到：暂停被清除（resume）或收到停止信号（stop）
+            while self.paused and not self.stop_flag and not self._stop_event.is_set():
+                self._pause_event.wait(0.5)  # 每0.5秒检查一次，以便响应停止
+            self.logger.debug("退出暂停等待...")
+        return self.stop_flag or self._stop_event.is_set()
 
     def is_running(self):
         """检查是否正在运行（包括测试模式）"""
@@ -3028,14 +3074,7 @@ class TradeRoute:
 
     def is_paused(self):
         """检查是否暂停"""
-        return self.paused
-
-    def _check_stop(self):
-        """检查是否停止（包括测试模式和主模式）"""
-        if self.stop_flag:
-            self.logger.info("检测到停止信号")
-            return True
-        return False
+        return self._pause_event.is_set() and not self._stop_event.is_set()
 
     def _finish(self):
         self.running = False
@@ -3047,7 +3086,14 @@ class TradeRoute:
     def _run_trade_loop(self):
         try:
             # 初始进入主界面
+            if self._wait_if_paused():
+                self._finish()
+                return
             if not self._check_and_enter_main_ui():
+                self._finish()
+                return
+
+            if self._wait_if_paused():
                 self._finish()
                 return
             if not self._wait_for_departure():
@@ -3077,37 +3123,67 @@ class TradeRoute:
                 return
 
             while self.running and (time.time() - start_time) < run_time:
-                if self._check_stop():
+                # 检查停止和暂停
+                if self.stop_flag:
                     break
-                while self.paused and self.running:
-                    time.sleep(0.5)
+                if self._wait_if_paused():
+                    break
 
                 # 1. 前往另一城市
                 self.logger.info(f"========== 从 {current_city} 前往 {other_city} ==========")
                 if not self._travel_to_city(other_city):
                     break
 
+                # 检查停止和暂停
+                if self.stop_flag:
+                    break
+                if self._wait_if_paused():
+                    break
+
                 # 2. 在另一城市卖出
                 self.logger.info(f"========== 在 {other_city} 卖出 ==========")
                 ready_to_buy = self._execute_city_trade(other_city, is_buy=False)
+
+                # 检查停止和暂停
+                if self.stop_flag:
+                    break
+                if self._wait_if_paused():
+                    break
 
                 # 3. 卖出后简化买入（已处于交易所界面）
                 if ready_to_buy:
                     self.logger.info(f"========== 在 {other_city} 简化买入 ==========")
                     self._execute_full_buy_operation(other_city)
                 else:
-                    # 降级：完整买入（理论上不会发生）
                     self.logger.info(f"========== 在 {other_city} 完整买入 ==========")
                     self._execute_city_trade(other_city, is_buy=True)
+
+                # 检查停止和暂停
+                if self.stop_flag:
+                    break
+                if self._wait_if_paused():
+                    break
 
                 # 4. 返回原城市
                 self.logger.info(f"========== 从 {other_city} 返回 {current_city} ==========")
                 if not self._travel_to_city(current_city):
                     break
 
+                # 检查停止和暂停
+                if self.stop_flag:
+                    break
+                if self._wait_if_paused():
+                    break
+
                 # 5. 在原城市卖出
                 self.logger.info(f"========== 在 {current_city} 卖出 ==========")
                 ready_to_buy = self._execute_city_trade(current_city, is_buy=False)
+
+                # 检查停止和暂停
+                if self.stop_flag:
+                    break
+                if self._wait_if_paused():
+                    break
 
                 # 6. 简化买入
                 if ready_to_buy:
@@ -3432,46 +3508,49 @@ class TradeRoute:
             return self._execute_full_sell_operation(actual_city)
 
     def _travel_to_city(self, target_city):
-        """
-        完整旅途：地图选点 → 启动旅途（拖车或前往目的地）→ 等待行车检测/周提示出发 → 户外环节
-        """
         self.logger.info(f"导航到目标城市: {target_city}")
 
-        # 1. 返回主界面并点击启程
+        # 返回主界面并点击启程
         self._back_to_main_ui()
         time.sleep(1)
+        if self._wait_if_paused():
+            return False
         if not self._click_qicheng():
             return False
 
-        # 2. 地图选点
+        # 地图选点
+        if self._wait_if_paused():
+            return False
         if not self._navigate_to_city(target_city):
             return False
 
-        # 3. 启动旅途
+        # 启动旅途
+        if self._wait_if_paused():
+            return False
         trailer_used = self._use_trailer_if_needed()
         if not trailer_used:
-            self.logger.info("点击前往目的地按钮")
             if not self._click_go_destination_button():
                 return False
             time.sleep(1)
 
-        # 4. 等待行车检测或周提示出发（最多20秒）
+        # 等待行车检测（添加检查）
         self.logger.info("等待行车检测或周提示出发...")
         for _ in range(20):
-            if self._check_stop():
+            if self.stop_flag:
                 return False
+            if self._wait_if_paused():
+                return False
+
             screenshot = self.adb.screenshot()
             if not screenshot:
                 time.sleep(1)
                 continue
 
-            # 检查行车检测
-            if self.image_rec.find_image(screenshot, "行车检测.png",  ):
+            if self.image_rec.find_image(screenshot, "行车检测.png"):
                 self.logger.info("检测到行车检测，旅途已开始")
                 break
 
-            # 检查周提示出发
-            result = self.image_rec.find_image(screenshot, "周提示出发.png",  )
+            result = self.image_rec.find_image(screenshot, "周提示出发.png")
             if result:
                 self.logger.info("检测到周提示出发，准备点击")
                 self.adb.click(1331, 775)
@@ -3484,10 +3563,12 @@ class TradeRoute:
         else:
             self.logger.warning("未检测到行车检测或周提示出发")
 
-        # 5. 户外环节（捡垃圾 + 到站检测）
+        # 户外环节
+        if self._wait_if_paused():
+            return False
         self._handle_outdoor_phase()
 
-        # 6. 确认到达
+        # 确认到达
         time.sleep(2)
         self._confirm_arrival_by_ui(target_city)
         return True
@@ -3735,11 +3816,11 @@ class TradeRoute:
         self.logger.info("开始砍价流程...")
         max_attempts = 20
         for attempt in range(max_attempts):
-            if self._check_stop():
+            # 添加检查
+            if self.stop_flag:
                 break
-            while self.paused and self.running:
-                time.sleep(0.5)
-
+            if self._wait_if_paused():
+                break
             # 检查是否已达到20.0%
             screenshot = self.adb.screenshot()
             if screenshot:
@@ -3825,11 +3906,11 @@ class TradeRoute:
         self.logger.info("开始抬价流程...")
         max_attempts = 20
         for attempt in range(max_attempts):
-            if self._check_stop():
+            # 添加检查
+            if self.stop_flag:
                 break
-            while self.paused and self.running:
-                time.sleep(0.5)
-
+            if self._wait_if_paused():
+                break
             # 检查是否已达到20.0%
             screenshot = self.adb.screenshot()
             if screenshot:
@@ -3878,7 +3959,6 @@ class TradeRoute:
             return True
 
         return False
-
 
     def _click_sell_until_empty(self):
         """点击卖出按钮1次"""
@@ -3977,15 +4057,16 @@ class TradeRoute:
         买入结束后处理退出
         检测区域(832,982)->(1085,1059)是否有'触碰空白区域退出'文字
         有则点击退出
+        如果没有，则检测'商店买入'，检测到后点击，然后继续检测触碰空白区域退出
         """
         self.logger.info("买入结束，处理退出...")
-
+        time.sleep(2)
         # 空白区域坐标
         BLANK_AREA = (832, 982, 1085, 1059)
         blank_center_x = (BLANK_AREA[0] + BLANK_AREA[2]) // 2
         blank_center_y = (BLANK_AREA[1] + BLANK_AREA[3]) // 2
 
-        max_attempts = 5
+        max_attempts = 50
         for attempt in range(max_attempts):
             if self._check_stop():
                 return
@@ -3997,6 +4078,7 @@ class TradeRoute:
                 time.sleep(0.5)
                 continue
 
+            # 1. 检查空白区域是否有'触碰空白区域退出'文字
             text = self.image_rec.recognize_text(screenshot, BLANK_AREA)
             self.logger.info(f"空白区域识别到文字: '{text}'")
 
@@ -4006,20 +4088,30 @@ class TradeRoute:
                 time.sleep(0.5)
                 return
 
-            self.logger.info(f"未检测到退出文字，第{attempt + 1}次重试")
+            # 2. 没有找到退出文字，尝试检测'商店买入'
+            shop_buy_result = self.image_rec.find_image(screenshot, "商店买入.png")
+            if shop_buy_result:
+                self.logger.info("检测到商店买入，点击确认")
+                self.adb.click(shop_buy_result[0], shop_buy_result[1])
+                time.sleep(0.5)
+                # 点击后继续循环，检测触碰空白区域退出
+                self.logger.info("等待触碰空白区域退出...")
+                continue
+
+            self.logger.info(f"未检测到退出文字或商店买入，第{attempt + 1}次重试")
             time.sleep(0.5)
 
-        self.logger.warning("未检测到退出文字，继续执行")
+        self.logger.warning("未检测到退出文字或商店买入，继续执行")
 
     def _exit_trade_interface(self):
         """退出交易界面（卖出后调用）- 检测空白区域文字后点击退出"""
         self.logger.info("退出交易界面...")
-
+        time.sleep(2)
         BLANK_AREA = (832, 982, 1085, 1059)
         blank_center = ((BLANK_AREA[0] + BLANK_AREA[2]) // 2,
                         (BLANK_AREA[1] + BLANK_AREA[3]) // 2)
 
-        max_attempts = 5
+        max_attempts = 50
         for attempt in range(max_attempts):
             if self._check_stop():
                 return False
@@ -4031,7 +4123,7 @@ class TradeRoute:
                 time.sleep(0.5)
                 continue
 
-            # 检查空白区域是否有'触碰空白区域退出'文字
+            # 1. 检查空白区域是否有'触碰空白区域退出'文字
             text = self.image_rec.recognize_text(screenshot, BLANK_AREA)
             self.logger.info(f"空白区域识别到文字: '{text}'")
 
@@ -4041,10 +4133,20 @@ class TradeRoute:
                 time.sleep(0.5)
                 break
 
-            self.logger.info(f"未检测到退出文字，第{attempt + 1}次重试")
+            # 2. 没有找到退出文字，尝试检测'商店卖出'
+            shop_sell_result = self.image_rec.find_image(screenshot, "商店卖出.png")
+            if shop_sell_result:
+                self.logger.info("检测到商店卖出，点击确认")
+                self.adb.click(shop_sell_result[0], shop_sell_result[1])
+                time.sleep(0.5)
+                # 点击后继续循环，检测触碰空白区域退出
+                self.logger.info("等待触碰空白区域退出...")
+                continue
+
+            self.logger.info(f"未检测到退出文字或商店卖出，第{attempt + 1}次重试")
             time.sleep(0.5)
 
-        # 仅保留文字识别“我要买”，删除图像识别
+        # 检测“我要买”按钮（为下一轮买入做准备）
         screenshot = self.adb.screenshot()
         if screenshot:
             buy_text = self.image_rec.recognize_text(screenshot, self.BUY_CONFIRM_AREA)
@@ -4442,48 +4544,62 @@ class TradeRoute:
         self.litter_running = True
 
         def litter_click_loop():
+            """捡垃圾线程 - 降低优先级以减少前台卡顿"""
+
+            # ========== 降低线程优先级（仅Windows） ==========
+            try:
+                if platform.system() == "Windows":
+                    # 获取当前线程句柄
+                    current_thread = ctypes.windll.kernel32.GetCurrentThread()
+                    # 设置为低于正常优先级 (1 = THREAD_PRIORITY_BELOW_NORMAL)
+                    ctypes.windll.kernel32.SetThreadPriority(current_thread, 1)
+            except Exception as e:
+                self.logger.debug(f"设置线程优先级失败（不影响功能）: {e}")
+            # ========== 线程主循环 ==========
             self.logger.info("捡垃圾线程启动")
             while self.litter_running and not self._check_stop():
                 litter_enabled = self.config.get_bool('Litter', 'enabled', False)
                 if litter_enabled and not self.paused:
                     litter_x = self.config.get_int('Litter', 'click_x', 1100)
                     litter_y = self.config.get_int('Litter', 'click_y', 600)
-                    self.adb.click(litter_x, litter_y, log=False)  # 不输出点击日志
+                    self.adb.click(litter_x, litter_y, log=False)
                 interval = self.config.get_float('Litter', 'click_interval', 0.5)
                 time.sleep(interval)
 
-        # 启动捡垃圾线程（无论配置是否启用，线程都运行，内部根据配置决定是否点击）
+        # 启动捡垃圾线程
         litter_thread = threading.Thread(target=litter_click_loop, daemon=True)
         litter_thread.start()
 
         try:
-            # 等待行车检测
+            # 等待行车检测（添加检查）
             self.logger.info("等待行车检测...")
             for _ in range(30):
-                if self._check_stop():
+                if self.stop_flag:
+                    return False
+                if self._wait_if_paused():
                     return False
                 screenshot = self.adb.screenshot()
-                if screenshot and self.image_rec.find_image(screenshot, "行车检测.png", ):
+                if screenshot and self.image_rec.find_image(screenshot, "行车检测.png"):
                     self.logger.info("检测到行车检测，进入户外")
                     break
                 time.sleep(1)
 
-            # 等待到站检测
+            # 等待到站检测（添加检查）
             self.logger.info("等待到站检测...")
-            for _ in range(390):
-                if self._check_stop():
+            for _ in range(600):
+                if self.stop_flag:
+                    return False
+                if self._wait_if_paused():
                     return False
                 screenshot = self.adb.screenshot()
                 if screenshot:
-                    # 图像识别“进入站点”
-                    result = self.image_rec.find_image(screenshot, "进入站点.png", )
+                    result = self.image_rec.find_image(screenshot, "进入站点.png")
                     if result:
                         self.logger.info(f"检测到进入站点，点击坐标: ({result[0]}, {result[1]})")
                         self.adb.click(result[0], result[1])
-                        time.sleep(3)
                         self.logger.info("户外环节完成，进入卖出环节")
                         return True
-                time.sleep(5)
+                time.sleep(9)
 
             self.logger.error_red("[Warning]未检测到进入站点，超时")
             return False
