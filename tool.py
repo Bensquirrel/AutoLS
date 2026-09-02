@@ -1,8 +1,13 @@
 """
 批量重命名图片文件脚本
 可以自定义目标目录、前缀、是否包含子目录等
-"""
 
+
+pyinstaller --onedir --windowed --icon=p2.ico --name=幻帮跑商v0.7 --add-data "picture;picture" --add-data "adb;adb" --add-data "ocr/det.onnx;ocr" --add-data "ocr/rec.onnx;ocr" --add-data "ocr/keys.txt;ocr" --add-data "ocr/rapidocr_config.yaml;ocr" --add-data "ocr/cls.onnx;ocr" --add-data "configs.ini;." --add-data "p2.ico;." --exclude-module easyocr --exclude-module torch --exclude-module torchvision --exclude-module scipy --exclude-module skimage --exclude-module bidi main.py
+
+推荐使用项目内的 幻帮跑商.spec 打包，spec 会自动把发布版 configs.ini 的 Debug.debug 设为 0。
+
+"""
 import os
 from pathlib import Path
 

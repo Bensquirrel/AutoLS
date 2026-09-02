@@ -2,14 +2,10 @@ import configparser
 import ctypes
 import logging
 import os
-# PyTorch 内存分配优化
-import torch
-#完整的内存优化配置
-os.environ['OMP_NUM_THREADS'] = '2'
-os.environ['MKL_NUM_THREADS'] = '2'
-os.environ['TORCH_NO_CUDA'] = '1'
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-torch.set_num_threads(2)  # 等同上面环境变量
+
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+
 import platform
 import subprocess  # 添加 subprocess 导入
 import sys
@@ -19,7 +15,6 @@ import tkinter as tk
 import re
 import json
 import traceback
-import easyocr
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog
@@ -28,7 +23,6 @@ import cv2
 import numpy as np
 from PIL import Image
 from PIL import ImageTk
-
 
 def resource_path(relative_path):
     """获取资源的绝对路径，打包后资源在 exe 所在目录的 _internal 下"""
@@ -133,8 +127,12 @@ class ConfigManager:
         self._config['ADB'] = {
             'default_port': '5555',
             'screenshot_quality': '90',
-            'screenshot_path': 'temp/screenshot.png',
-            'cn': json.dumps({"default_port": "端口"}),
+            'screenshot_path': 'temp/screenshot.jpg',
+            'cn': json.dumps({
+                "default_port": "端口",
+                "screenshot_quality": "截图质量",
+                "screenshot_path": "截图保存路径"
+            }),
             'section_cn': 'ADB设置'
         }
 
@@ -142,18 +140,23 @@ class ConfigManager:
         self._config['Recognition'] = {
             'match_threshold': '0.82',
             'use_gray': 'True',
-            'scale_factor': '1.0',
             'template_folder': 'picture',
             'cn': json.dumps({"match_threshold": "匹配阈值", "use_gray": "使用灰度", "template_folder": "模板文件夹"}),
             'section_cn': '图像识别'
         }
 
-        # OCR识别配置
+        # OCR识别配置：语种由 ocr 目录内的 Maa 模型决定，无需单独配置语言
         self._config['OCR'] = {
-            'language': 'ch_sim',
-            'preprocess': 'True',
-            'use_gpu': 'False',
-            'cn': json.dumps({"language": "识别语言", "preprocess": "预处理", "use_gpu": "GPU加速"}),
+            'preprocess': 'False',
+            'text_score': '0.5',
+            'box_thresh': '0.5',
+            'unclip_ratio': '1.6',
+            'cn': json.dumps({
+                "preprocess": "识别前二值化",
+                "text_score": "识别置信度阈值(0-1)",
+                "box_thresh": "检测框置信度阈值(0-1)",
+                "unclip_ratio": "检测框扩展倍率(1.0-2.0)"
+            }),
             'section_cn': 'OCR识别'
         }
 
@@ -185,7 +188,7 @@ class ConfigManager:
 
         # UI配置
         self._config['UI'] = {
-            'version': 'v0.1',
+            'version': 'v0.7',
             'cn': json.dumps({"version": "版本号"}),
             'section_cn': '界面设置'
         }
@@ -427,13 +430,18 @@ class ADBController:
         self.port = None
         self.logger.info("已断开ADB连接")
 
-    def screenshot(self, save_path="temp/screenshot.png"):
+    def screenshot(self, save_path=None):
         """截取设备屏幕并保存到本地"""
         if not self.connected:
             self.logger.error("ADB未连接")
             return None
 
         try:
+            # 未显式指定路径时，使用配置中的截图保存路径与截图质量
+            if save_path is None:
+                save_path = self.config.get('ADB', 'screenshot_path', 'temp/screenshot.jpg')
+            screenshot_quality = min(100, max(1, self.config.get_int('ADB', 'screenshot_quality', 90)))
+
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
             device_serial = f"{self.host}:{self.port}"
             temp_path = "/sdcard/screenshot_temp.png"
@@ -455,6 +463,22 @@ class ADBController:
             )
 
             if Path(save_path).exists() and Path(save_path).stat().st_size > 0:
+                # 截图质量对 JPG/JPEG 输出生效：先取出 PNG，再按配置质量编码为 JPG
+                if Path(save_path).suffix.lower() in ('.jpg', '.jpeg'):
+                    file_bytes = np.fromfile(save_path, dtype=np.uint8)
+                    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                    if image is None:
+                        self.logger.error(f"截图文件读取失败，无法应用截图质量: {save_path}")
+                        return None
+                    ok, encoded = cv2.imencode(
+                        '.jpg', image,
+                        [cv2.IMWRITE_JPEG_QUALITY, screenshot_quality]
+                    )
+                    if not ok:
+                        self.logger.error(f"JPG 编码失败，无法应用截图质量: {save_path}")
+                        return None
+                    encoded.tofile(save_path)
+                    self.logger.info(f"截图已按质量 {screenshot_quality}% 保存为 JPG: {save_path}")
                 self.logger.info(f"截图保存至: {save_path}")
                 return save_path
             else:
@@ -647,67 +671,138 @@ class ImageRecognition:
         # 确保模板文件夹存在
         Path(self.picture_folder).mkdir(parents=True, exist_ok=True)
 
-        # 初始化 EasyOCR
-        self.easyocr_reader = None
-        self._setup_easyocr()
+        # 初始化 Maa OCR（MaaCommonAssets PP-OCR 转 ONNX + RapidOCR/ONNX Runtime）
+        self.ocr_engine = None
+        self.ocr_model_dir = None
+        self._setup_ocr()
 
-    def _setup_easyocr(self):
-        """设置 EasyOCR，使用项目目录下的 ocr 文件夹作为模型存储位置"""
+    @staticmethod
+    def _find_ocr_model_dir(root_dir):
+        """在 ocr 目录（含解压产生的多级子目录）中查找 Maa OCR 模型目录。
+
+        MaaCommonAssets 模型需要同时包含 det.onnx、rec.onnx、keys.txt 三个文件。
+        """
+        required = {"det.onnx", "rec.onnx", "keys.txt"}
+
+        if root_dir.is_dir():
+            root_files = {p.name for p in root_dir.iterdir() if p.is_file()}
+            if required.issubset(root_files):
+                return Path(root_dir)
+
+        # 兼容下载压缩包直接解压到 ocr/ 后多一层目录的情况
+        matches = []
+        for det_file in root_dir.rglob("det.onnx"):
+            if not det_file.is_file():
+                continue
+            model_dir = det_file.parent
+            model_files = {p.name for p in model_dir.iterdir() if p.is_file()}
+            if required.issubset(model_files):
+                matches.append(model_dir)
+
+        if not matches:
+            return None
+        # 多个模型目录时，优先使用层级最浅（最接近 ocr/ 根目录）的一组
+        matches.sort(key=lambda p: (len(p.parts), str(p).lower()))
+        return matches[0]
+
+    def _setup_ocr(self):
+        """初始化 Maa OCR：加载 MaaCommonAssets 的 PP-OCR ONNX 模型。
+
+        模型文件位于 ocr 目录：det.onnx、rec.onnx、keys.txt。
+        下载地址（官方 MaaCommonAssets）：
+        https://download.maafw.xyz/MaaCommonAssets/OCR/ppocr_v6/ppocr_v6-small.zip
+        """
         try:
-            # 获取项目根目录下的 ocr 文件夹路径
-            project_root = Path.cwd()  # 当前工作目录（项目根目录）
-            model_storage_path = Path(resource_path("ocr"))
+            model_root = Path(resource_path("ocr"))
+            model_root.mkdir(parents=True, exist_ok=True)
+            self.logger.info(f"OCR 模型根目录: {model_root}")
 
-            # 确保 ocr 文件夹存在
-            model_storage_path.mkdir(parents=True, exist_ok=True)
+            model_dir = self._find_ocr_model_dir(model_root)
+            if model_dir is None:
+                self.logger.error(
+                    "未找到 Maa OCR 模型文件（需要 det.onnx、rec.onnx、keys.txt）。"
+                    "请下载 https://download.maafw.xyz/MaaCommonAssets/OCR/ppocr_v6/ppocr_v6-small.zip "
+                    "并解压到 ocr/ 目录。注意：新引擎不再使用 ocr/*.pth 旧 EasyOCR 模型。"
+                )
+                self.ocr_engine = None
+                return
 
-            self.logger.info(f"OCR 模型存储路径: {model_storage_path}")
+            old_pth_files = list(model_root.rglob("*.pth"))
+            if old_pth_files:
+                self.logger.warning(
+                    f"发现 {len(old_pth_files)} 个旧 EasyOCR 模型(.pth)，新引擎已不再使用，"
+                    "可在确认新 OCR 正常后手动删除以节省约 100MB 空间。"
+                )
 
-            # 检查模型文件是否存在
-            model_files = list(model_storage_path.glob("*.pth"))
-            if model_files:
-                self.logger.info(f"找到 {len(model_files)} 个本地模型文件")
-            else:
-                self.logger.warning("未找到本地模型，将自动下载到 ocr 文件夹")
+            self.logger.info(f"使用 Maa OCR 模型目录: {model_dir}")
 
-            # 配置 EasyOCR 使用本地模型路径
-            # 通过设置环境变量或直接传递给 Reader
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+            except ImportError as exc:
+                raise RuntimeError(
+                    "缺少 RapidOCR/ONNX Runtime 依赖，请先执行: "
+                    "pip install rapidocr-onnxruntime==1.4.4"
+                ) from exc
 
-            # 优化参数：只加载必要模型，禁用GPU
-            self.easyocr_reader = easyocr.Reader(
-                ['ch_sim'],
-                gpu=False,
-                model_storage_directory=str(model_storage_path),
-                verbose=False,
-                # 以下参数降低内存
-                quantize=True,  # 模型量化，减少内存
-                download_enabled=False,  # 禁止下载（已有模型时）
+            # RapidOCR 初始化时会读取 config.yaml 并创建方向分类器；
+            # 这里显式传入项目内自带的配置与 cls.onnx，保证 PyInstaller 打包后不依赖
+            # rapidocr_onnxruntime 包内的文件。实际识别时 use_cls=False，cls.onnx 不会被调用。
+            maa_engine_config = model_root / "rapidocr_config.yaml"
+            maa_cls_model = model_root / "cls.onnx"
+            if not maa_engine_config.is_file() or not maa_cls_model.is_file():
+                raise RuntimeError(
+                    "缺少 RapidOCR 引擎配套文件 ocr/rapidocr_config.yaml 或 ocr/cls.onnx，"
+                    "请检查项目是否完整。"
+                )
+
+            # Maa 模型只提供检测与识别模型，不含方向分类模型；
+            # 因此方向分类(use_cls=False)关闭，推理使用 CPU 版 ONNX Runtime。
+            self.ocr_engine = RapidOCR(
+                config_path=str(maa_engine_config),
+                det_model_path=str(model_dir / "det.onnx"),
+                cls_model_path=str(maa_cls_model),
+                rec_model_path=str(model_dir / "rec.onnx"),
+                rec_keys_path=str(model_dir / "keys.txt"),
+                use_det=True,
+                use_cls=False,
+                use_rec=True,
+                print_verbose=False,
+                intra_op_num_threads=2,
+                inter_op_num_threads=1,
             )
-
-            self.logger.info("EasyOCR 已就绪，支持中文识别")
-            self.logger.info(f"模型将保存在: {model_storage_path}")
+            self.ocr_model_dir = str(model_dir)
+            self.logger.info("Maa OCR 已就绪（PP-OCR 转 ONNX + RapidOCR/ONNX Runtime，CPU 推理）")
 
         except Exception as e:
-            self.logger.error(f"EasyOCR 初始化失败: {str(e)}")
-            self.easyocr_reader = None
+            self.logger.error(f"Maa OCR 初始化失败: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            self.ocr_engine = None
 
     def recognize_text(self, screenshot_path, area=None):
         """
-        使用 EasyOCR 识别截图中的文字
+        使用 Maa OCR 识别截图中的文字
         :param screenshot_path: 截图文件路径
         :param area: 识别区域 (x1, y1, x2, y2)，None表示全图识别
         :return: 识别出的文字字符串
         """
-        if self.easyocr_reader is None:
-            self.logger.error("EasyOCR 未初始化，无法识别文字")
+        if self.ocr_engine is None:
+            self.logger.error("Maa OCR 引擎未初始化（缺少模型或依赖），无法识别文字")
             return ""
 
         try:
+            # 从配置读取 OCR 调优参数（RapidOCR 每次调用都会应用新值）
+            box_thresh = min(1.0, max(0.0, self.config.get_float('OCR', 'box_thresh', 0.5)))
+            unclip_ratio = min(2.0, max(1.0, self.config.get_float('OCR', 'unclip_ratio', 1.6)))
+            text_score = min(1.0, max(0.0, self.config.get_float('OCR', 'text_score', 0.5)))
+
             # 读取图片
             image = cv2.imread(screenshot_path)
             if image is None:
-                self.logger.error(f"无法读取图片: {screenshot_path}")
-                return ""
+                # 支持中文路径
+                image = self._imread_chinese(screenshot_path)
+                if image is None:
+                    self.logger.error(f"无法读取图片: {screenshot_path}")
+                    return ""
 
             # 如果指定了区域，裁剪图像
             if area:
@@ -716,22 +811,35 @@ class ImageRecognition:
                 self.logger.info(f"识别区域: ({x1},{y1}) -> ({x2},{y2})")
 
             # 可选：图像预处理，提高识别率
-            if self.config.get_bool('OCR', 'preprocess', True):
+            if self.config.get_bool('OCR', 'preprocess', False):
                 # 转为灰度图
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                 # 二值化，将文字与背景分离
                 _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-                image = binary
+                # ONNX/PaddleOCR 模型要求 3 通道输入，二值化后转回 BGR
+                image = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
 
-            # 执行 OCR 识别
-            # detail=0 只返回文本，不返回坐标和置信度
-            result = self.easyocr_reader.readtext(image, detail=0, paragraph=False)
+            # 执行 OCR 识别（use_cls=False：Maa 模型不含方向分类模型）
+            output = self.ocr_engine(
+                image,
+                use_det=True,
+                use_cls=False,
+                use_rec=True,
+                box_thresh=box_thresh,
+                unclip_ratio=unclip_ratio,
+                text_score=text_score,
+            )
+            result = output[0] if isinstance(output, (tuple, list)) else output
 
             if result:
-                # 合并所有识别到的文本
-                text = '\n'.join(result)
+                # RapidOCR 返回 [[box, 文本, 置信度], ...]，这里只取文本合并
+                text_lines = []
+                for item in result:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        text_lines.append(str(item[1]))
+                text = '\n'.join(text_lines)
                 text = text.strip()
-                self.logger.info(f"识别到 {len(result)} 行文字")
+                self.logger.info(f"识别到 {len(text_lines)} 行文字")
                 if len(text) > 200:
                     self.logger.info(f"识别文本预览: {text[:200]}...")
                 else:
@@ -752,11 +860,15 @@ class ImageRecognition:
         :param area: 识别区域 (x1, y1, x2, y2)，None表示全图识别
         :return: 列表，每个元素为 ([[坐标]], 文本, 置信度)
         """
-        if self.easyocr_reader is None:
-            self.logger.error("EasyOCR 未初始化，无法识别文字")
+        if self.ocr_engine is None:
+            self.logger.error("Maa OCR 引擎未初始化（缺少模型或依赖），无法识别文字")
             return []
 
         try:
+            box_thresh = min(1.0, max(0.0, self.config.get_float('OCR', 'box_thresh', 0.5)))
+            unclip_ratio = min(2.0, max(1.0, self.config.get_float('OCR', 'unclip_ratio', 1.6)))
+            text_score = min(1.0, max(0.0, self.config.get_float('OCR', 'text_score', 0.5)))
+
             # 读取图片
             image = cv2.imread(screenshot_path)
             if image is None:
@@ -778,13 +890,35 @@ class ImageRecognition:
                 self.logger.info(f"识别区域: ({x1},{y1}) -> ({x2},{y2})")
 
             # 可选：图像预处理
-            if self.config.get_bool('OCR', 'preprocess', True):
+            if self.config.get_bool('OCR', 'preprocess', False):
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                 _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-                image = binary
+                image = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
 
-            # detail=1 返回完整信息（位置、文本、置信度）
-            results = self.easyocr_reader.readtext(image, detail=1, paragraph=False)
+            output = self.ocr_engine(
+                image,
+                use_det=True,
+                use_cls=False,
+                use_rec=True,
+                box_thresh=box_thresh,
+                unclip_ratio=unclip_ratio,
+                text_score=text_score,
+            )
+            results = output[0] if isinstance(output, (tuple, list)) else output
+            if results is None:
+                results = []
+
+            # 将 RapidOCR 结果统一成 EasyOCR 兼容格式: ([[4点坐标]], 文本, 置信度)
+            normalized = []
+            for item in results:
+                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                    continue
+                bbox, text, confidence = item[0], item[1], item[2]
+                if bbox is None:
+                    continue
+                bbox_list = [[float(point[0]), float(point[1])] for point in bbox]
+                normalized.append((bbox_list, str(text), float(confidence)))
+            results = normalized
 
             # 如果有区域偏移，调整坐标
             if offset_x != 0 or offset_y != 0:
@@ -1031,7 +1165,7 @@ class JailMasterGUI:
         self.root = tk.Tk()
         self.root.title("幻帮跑商")
         self.root.geometry("1200x800")
-        icon_path = resource_path("p.ico")  # 修改这里
+        icon_path = resource_path("p2.ico")  # 修改这里
         Path(resource_path("picture")).mkdir(exist_ok=True)
         Path(resource_path("picture/ui")).mkdir(exist_ok=True)
         Path(resource_path("picture/SHOP")).mkdir(exist_ok=True)
@@ -1570,7 +1704,19 @@ class JailMasterGUI:
             label = ttk.Label(scrollable_frame, text=f"{cn_name}:", font=("微软雅黑", 9))
             label.grid(row=row, column=0, sticky=tk.W, pady=5, padx=5)
 
-            if 'path' in key.lower() or 'folder' in key.lower():
+            if key == 'screenshot_path':
+                # 截图保存路径是完整文件名，不能使用目录选择，显示普通输入框
+                var = tk.StringVar(value=value)
+                entry = ttk.Entry(scrollable_frame, textvariable=var, width=40)
+                entry.grid(row=row, column=1, pady=5, padx=5, sticky=tk.W)
+
+                def save_screenshot_path(sv=var, sec=section, k=key):
+                    self.config.set(sec, k, sv.get())
+                    self.logger.info(f"配置已保存: {sec}.{k} = {sv.get()}")
+
+                var.trace_add('write', lambda *args, sv=var, sec=section, k=key: save_screenshot_path(sv, sec, k))
+
+            elif 'path' in key.lower() or 'folder' in key.lower():
                 # 路径选择
                 entry_frame = ttk.Frame(scrollable_frame)
                 entry_frame.grid(row=row, column=1, pady=5, padx=5, sticky=tk.W)
@@ -1633,7 +1779,7 @@ class JailMasterGUI:
 
                 var.trace_add('write', lambda *args: save_debug())
 
-            elif key == 'use_gpu' or key == 'use_gray' or key == 'preprocess':
+            elif key == 'use_gray' or key == 'preprocess':
                 # 其他布尔值使用复选框
                 var = tk.BooleanVar(value=value.lower() == 'true')
                 check = ttk.Checkbutton(scrollable_frame, text="启用", variable=var)
@@ -1645,6 +1791,40 @@ class JailMasterGUI:
                     self.logger.info(f"配置已保存: {section}.{key} = {new_value}")
 
                 var.trace_add('write', lambda *args: save_bool())
+
+            elif ('_score' in key.lower() or '_thresh' in key.lower()
+                  or '_ratio' in key.lower() or 'threshold' in key.lower()):
+                # OCR 置信度/阈值等使用浮点数输入框
+                vcmd = (parent.register(self._validate_float_input), '%P')
+                var = tk.StringVar(value=value)
+                entry = ttk.Entry(scrollable_frame, textvariable=var, width=12,
+                                  font=("微软雅黑", 9), validate='key', validatecommand=vcmd)
+                entry.grid(row=row, column=1, pady=5, padx=5, sticky=tk.W)
+
+                def save_float(sv=var, sec=section, k=key):
+                    self.config.set(sec, k, sv.get())
+                    self.logger.info(f"配置已保存: {sec}.{k} = {sv.get()}")
+
+                var.trace_add('write', lambda *args, sv=var, sec=section, k=key: save_float(sv, sec, k))
+
+            elif key == 'screenshot_quality':
+                # 截图质量使用整数输入框
+                vcmd = (parent.register(self._validate_int_input), '%P')
+                var = tk.StringVar(value=value)
+                entry_frame = ttk.Frame(scrollable_frame)
+                entry_frame.grid(row=row, column=1, pady=5, padx=5, sticky=tk.W)
+                entry = ttk.Entry(entry_frame, textvariable=var, width=6,
+                                  font=("微软雅黑", 9), validate='key', validatecommand=vcmd)
+                entry.pack(side=tk.LEFT)
+
+                def save_quality(sv=var, sec=section, k=key):
+                    self.config.set(sec, k, sv.get())
+                    self.logger.info(f"配置已保存: {sec}.{k} = {sv.get()}")
+
+                var.trace_add('write', lambda *args, sv=var, sec=section, k=key: save_quality(sv, sec, k))
+
+                unit_label = ttk.Label(entry_frame, text="%", foreground="gray", font=("微软雅黑", 9))
+                unit_label.pack(side=tk.LEFT, padx=(1, 0))
 
             elif 'count' in key.lower() or 'number' in key.lower() or 'num' in key.lower():
                 # 数量输入框（只允许数字）
@@ -1828,13 +2008,15 @@ class JailMasterGUI:
             if city_keys:
                 self._create_config_frame_with_auto_save(city_list_frame, 'City', city_keys)
 
-        # 各城市配置页
+        # 各城市配置页（延迟到第一次点击对应页签时才创建，加快配置窗口打开速度）
         cities_str = self.config.get('City', 'cities', '')
         cities = [c.strip() for c in cities_str.split(',') if c.strip()]
 
         self.logger.info(f"加载 {len(cities)} 个城市配置")
 
-        for city in cities:
+        city_built = set()
+
+        def ensure_city_section(city):
             city_section = f"City_{city}"
 
             # 确保配置节存在
@@ -1847,10 +2029,33 @@ class JailMasterGUI:
                 self.config.set(city_section, 'section_cn', f'{city}配置')
 
             keys = ['purchase_book_count', 'enable_bargain', 'enable_price_increase']
+            return city_section, keys
 
+        def on_city_tab_changed(event=None):
+            selected = city_notebook.select()
+            if not selected:
+                return
+            try:
+                index = city_notebook.index(selected)
+            except Exception:
+                return
+            if index < 1 or index - 1 >= len(cities):
+                return
+
+            city = cities[index - 1]
+            if city in city_built:
+                return
+            city_built.add(city)
+
+            frame = city_notebook.nametowidget(selected)
+            city_section, keys = ensure_city_section(city)
+            self._create_city_config_frame_with_auto_save(frame, city_section, keys, city)
+
+        for city in cities:
             city_frame = ttk.Frame(city_notebook)
             city_notebook.add(city_frame, text=city)
-            self._create_city_config_frame_with_auto_save(city_frame, city_section, keys, city)
+
+        city_notebook.bind('<<NotebookTabChanged>>', on_city_tab_changed)
 
     def _create_config_frame(self, parent, section, keys):
         """创建配置框架"""
@@ -1916,7 +2121,7 @@ class JailMasterGUI:
                 check.grid(row=row, column=1, pady=5, padx=5, sticky=tk.W)
                 self.config_vars[f'{section}_{key}'] = ('debug_bool', var)
 
-            elif key == 'use_gpu' or key == 'use_gray' or key == 'preprocess':
+            elif key == 'use_gray' or key == 'preprocess':
                 # 其他布尔值使用复选框
                 var = tk.BooleanVar(value=value.lower() == 'true')
                 check = ttk.Checkbutton(scrollable_frame, text="启用", variable=var)
@@ -3510,7 +3715,7 @@ class TradeRoute:
     def _travel_to_city(self, target_city):
         self.logger.info(f"导航到目标城市: {target_city}")
 
-        # 返回主界面并点击启程
+        # 返回主界面并点击启程（第一次尝试）
         self._back_to_main_ui()
         time.sleep(1)
         if self._wait_if_paused():
@@ -3518,13 +3723,28 @@ class TradeRoute:
         if not self._click_qicheng():
             return False
 
-        # 地图选点
-        if self._wait_if_paused():
-            return False
-        if not self._navigate_to_city(target_city):
+        # 地图选点 - 增加重试机制（最多尝试10次）
+        max_retries = 10
+        for attempt in range(max_retries):
+            if self._wait_if_paused():
+                return False
+            if self._navigate_to_city(target_city):
+                break  # 导航成功，跳出循环
+            else:
+                self.logger.warning(f"第{attempt + 1}次导航到 {target_city} 失败，返回主界面重试")
+                # 返回主界面并重新点击启程
+                self._back_to_main_ui()
+                time.sleep(1)
+                if self._wait_if_paused():
+                    return False
+                if not self._click_qicheng():
+                    return False
+        else:
+            # 所有尝试都失败
+            self.logger.error(f"多次导航到 {target_city} 失败")
             return False
 
-        # 启动旅途
+        # 启动旅途（拖车或前往目的地）
         if self._wait_if_paused():
             return False
         trailer_used = self._use_trailer_if_needed()
