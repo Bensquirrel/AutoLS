@@ -188,7 +188,7 @@ class ConfigManager:
 
         # UI配置
         self._config['UI'] = {
-            'version': 'v0.7',
+            'version': 'v1.0.0',
             'cn': json.dumps({"version": "版本号"}),
             'section_cn': '界面设置'
         }

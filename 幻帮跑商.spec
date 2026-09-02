@@ -54,7 +54,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='幻帮跑商v0.7',
+    name='幻帮跑商v1.0.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
